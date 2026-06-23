@@ -97,6 +97,36 @@ statistically distinguish the Poisson-scheduled cover stream
 from one whose timing is influenced by user activity — the
 strictest form of metadata privacy.
 
+## Scopes: global vs. per-connection
+
+`peashape` supports two scheduling scopes:
+
+- `ShapingScope::Global` (default) — one global ticker;
+  every tick broadcasts the next frame to `fanout` random
+  connected peers. This is the natural choice for
+  gossip-style protocols where a single message goes to
+  many destinations.
+- `ShapingScope::PerConnection` — one ticker per connection;
+  every tick sends one frame to a single round-robin
+  peer. `fanout` is ignored in this mode.
+
+## Unicast and broadcast
+
+Two complementary submit methods are provided:
+
+- `Node::send_shaped(peer, payload)` — sends to one specific
+  peer (or silently drops the frame if the peer is no longer
+  connected at tick time).
+- `Node::broadcast_shaped(payload)` — fanout-based broadcast
+  (in `Global` mode) or round-robin (in `PerConnection`).
+
+The same pair of methods is available for the *low*-priority
+lane: `Node::send_shaped_low(peer, payload)` and
+`Node::broadcast_shaped_low(payload)`. And for re-broadcasting
+a pre-built frame byte-for-byte (e.g. a frame received from
+a peer that you want to relay unchanged):
+`Node::relay_shaped(frame)`.
+
 ## Threat model
 
 `peashape` is designed to defeat a *passive global network
