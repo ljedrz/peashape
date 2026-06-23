@@ -1,0 +1,25 @@
+[package]
+name = "peashape"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR CC0-1.0"
+description = "A traffic-shaping middleware for pea2pea nodes: constant-rate or Poisson outbound traffic, automatic frame padding, and priority lanes for cover traffic."
+repository = "https://github.com/ljedrz/peashape"
+readme = "README.md"
+keywords = ["p2p", "networking", "privacy", "cover-traffic", "middleware"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+pea2pea = "0.56"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+bytes = "1"
+tracing = "0.1"
+rand = "0.9"
+parking_lot = "0.12"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
