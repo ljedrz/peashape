@@ -38,6 +38,13 @@ pub struct Scheduler {
     /// every node in a small ring happening to select the same
     /// peer on the same tick.
     cursor: Mutex<usize>,
+    /// The peers selected on the previous [`ShapingScope::Global`]
+    /// tick, used to bias the next selection toward *fresh* peers.
+    /// This prevents the gossip "ping-pong" failure mode in which two
+    /// adjacent nodes bounce a frame back and forth without it
+    /// reaching the rest of the overlay. Unused in
+    /// [`ShapingScope::PerConnection`] mode.
+    last_peers: Mutex<Vec<SocketAddr>>,
 }
 
 impl Scheduler {
@@ -49,6 +56,7 @@ impl Scheduler {
             strategy,
             wake: Notify::new(),
             cursor: Mutex::new(0),
+            last_peers: Mutex::new(Vec::new()),
         }
     }
 
@@ -272,32 +280,60 @@ impl Scheduler {
         }
     }
 
-    /// Pick `fanout` distinct peer addresses from `peers` using
-    /// a cursor + per-pick random offset. The cursor advances on
-    /// every pick, so over time the selection rotates through
-    /// the whole peer set even when `fanout` is small.
+    /// Pick `fanout` distinct peer addresses from `peers`, biasing the
+    /// selection away from the peers chosen on the previous tick.
+    ///
+    /// The selection proceeds in two phases:
+    ///
+    /// 1. Prefer "fresh" peers (not in `last_peers`). This avoids the
+    ///    gossip ping-pong failure mode where two adjacent nodes bounce
+    ///    a frame between themselves instead of spreading it.
+    /// 2. If the fresh pool is exhausted before `fanout` peers are
+    ///    chosen, fall back to the recently-used pool.
+    ///
+    /// Within each pool a cursor + per-pick random offset rotates the
+    /// selection through the whole peer set over time and keeps two
+    /// adjacent nodes from selecting the same "next" peer in lockstep.
     fn pick_targets(&self, peers: &[SocketAddr], fanout: usize) -> Vec<SocketAddr> {
-        let mut rng = rand::rng();
-        let mut cursor = self.cursor.lock();
         let n = peers.len();
         if n == 0 {
             return Vec::new();
         }
-        // Work on a list of *positions* so removal is O(n) but
-        // bounded by the peer count.
-        let mut pool: Vec<usize> = (0..n).collect();
-        let mut chosen: Vec<SocketAddr> = Vec::with_capacity(fanout);
-        for _ in 0..fanout.min(n) {
-            let remaining = pool.len();
-            if remaining == 0 {
-                break;
+        let mut rng = rand::rng();
+        let mut cursor = self.cursor.lock();
+        let mut last_peers = self.last_peers.lock();
+
+        // Partition peer *positions* into fresh (not sent to last tick)
+        // and recently-used pools.
+        let mut fresh: Vec<usize> = Vec::new();
+        let mut used: Vec<usize> = Vec::new();
+        for (i, p) in peers.iter().enumerate() {
+            if last_peers.contains(p) {
+                used.push(i);
+            } else {
+                fresh.push(i);
             }
+        }
+
+        let mut chosen: Vec<SocketAddr> = Vec::with_capacity(fanout.min(n));
+        for _ in 0..fanout.min(n) {
+            let pool = if !fresh.is_empty() {
+                &mut fresh
+            } else if !used.is_empty() {
+                &mut used
+            } else {
+                break;
+            };
+            let remaining = pool.len();
             let offset = rng.random_range(0..remaining);
             let pick = (*cursor + offset) % remaining;
             *cursor = cursor.wrapping_add(1);
-            let pos = pool.remove(pick);
-            chosen.push(peers[pos]);
+            chosen.push(peers[pool.remove(pick)]);
         }
+
+        // Remember this tick's selection to bias the next one.
+        last_peers.clear();
+        last_peers.extend_from_slice(&chosen);
         chosen
     }
 
