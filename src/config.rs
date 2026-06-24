@@ -2,7 +2,78 @@
 //!
 //! [`Node`]: crate::Node
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use bytes::BytesMut;
+
+/// Generates cover frames for a [`Node`] when its priority lanes are
+/// empty at a shaping tick.
+///
+/// The default generator ([`random_cover`]) fills each cover frame
+/// with uniform random bytes. Supply a custom generator via
+/// [`ShapeConfig::cover_generator`] to make cover traffic mimic a
+/// specific wire profile — for example, valid RTP packets, so that
+/// the *whole* stream (real frames and cover alike) looks like a
+/// media call to a passive observer rather than a mix of structured
+/// and random bytes.
+///
+/// # Contract
+///
+/// - `cover` is called from the scheduler on a tick whose lanes are
+///   empty, so it must be cheap and must not block.
+/// - It **must** return exactly `config.frame_size` bytes. A frame
+///   of any other size is rejected by the codec and silently
+///   dropped, which would break the constant-rate property.
+/// - Implementations are shared across threads and invoked through a
+///   shared reference, so any per-frame state (e.g. an RTP sequence
+///   counter) needs interior mutability (an `AtomicU16`, a `Mutex`,
+///   …).
+///
+/// A bare closure `Fn(&ShapeConfig) -> BytesMut` implements this
+/// trait, so trivial generators need no custom type.
+///
+/// [`random_cover`]: crate::random_cover
+/// [`Node`]: crate::Node
+pub trait CoverGenerator: Send + Sync {
+    /// Returns a single freshly-generated cover frame of exactly
+    /// `config.frame_size` bytes.
+    fn cover(&self, config: &ShapeConfig) -> BytesMut;
+
+    /// Finalizes a *real* (application-submitted, lane-drained) frame
+    /// just before it is written to the wire — called in send order,
+    /// on the same tick cadence as [`cover`](CoverGenerator::cover).
+    ///
+    /// The default returns the frame unchanged. Override it to fold
+    /// real frames into the *same* stream as cover — for example, to
+    /// stamp a shared RTP sequence number and timestamp — so that a
+    /// passive observer sees one coherent stream rather than two
+    /// independently-sequenced producers (the priority lanes and the
+    /// cover generator). This is what lets a node carry real traffic
+    /// over the priority lanes while still presenting a single,
+    /// in-order stream, which matters on connection-oriented
+    /// transports.
+    ///
+    /// Like [`cover`](CoverGenerator::cover), it must return exactly
+    /// `config.frame_size` bytes, and is invoked through a shared
+    /// reference, so any shared sequencing state needs interior
+    /// mutability. Coherent single-stream sequencing is a
+    /// [`PerConnection`](crate::ShapingScope::PerConnection) concept:
+    /// one stream per peer.
+    fn finalize_real(&self, config: &ShapeConfig, frame: BytesMut) -> BytesMut {
+        let _ = config;
+        frame
+    }
+}
+
+impl<F> CoverGenerator for F
+where
+    F: Fn(&ShapeConfig) -> BytesMut + Send + Sync,
+{
+    fn cover(&self, config: &ShapeConfig) -> BytesMut {
+        self(config)
+    }
+}
 
 /// The set of parameters that govern a [`Node`].
 ///
@@ -12,7 +83,7 @@ use std::time::Duration;
 /// struct.
 ///
 /// [`Node`]: crate::Node
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ShapeConfig {
     /// A friendly identifier of the node, surfaced in `tracing`
     /// output. If `None`, `pea2pea` assigns a numeric ID.
@@ -121,6 +192,15 @@ pub struct ShapeConfig {
     /// not support `SO_REUSEPORT` (in which case the listener
     /// fails to bind).
     pub reuse_listener_port: bool,
+
+    /// An optional custom cover-frame generator. When `None` (the
+    /// default), cover frames are uniform random bytes
+    /// ([`random_cover`]). Supply one to make cover traffic mimic a
+    /// specific wire profile (e.g. RTP packets); see
+    /// [`CoverGenerator`].
+    ///
+    /// [`random_cover`]: crate::random_cover
+    pub cover_generator: Option<Arc<dyn CoverGenerator>>,
 }
 
 impl Default for ShapeConfig {
@@ -156,7 +236,32 @@ impl Default for ShapeConfig {
             max_connections: 64,
             max_connections_per_ip: 8,
             reuse_listener_port: false,
+            cover_generator: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ShapeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShapeConfig")
+            .field("name", &self.name)
+            .field("listener_addr", &self.listener_addr)
+            .field("strategy", &self.strategy)
+            .field("scope", &self.scope)
+            .field("fanout", &self.fanout)
+            .field("frame_size", &self.frame_size)
+            .field("high_lane_capacity", &self.high_lane_capacity)
+            .field("low_lane_capacity", &self.low_lane_capacity)
+            .field("max_frame_size", &self.max_frame_size)
+            .field("max_connections", &self.max_connections)
+            .field("max_connections_per_ip", &self.max_connections_per_ip)
+            .field("reuse_listener_port", &self.reuse_listener_port)
+            // The generator is opaque; report only its presence.
+            .field(
+                "cover_generator",
+                &self.cover_generator.as_ref().map(|_| "<custom>"),
+            )
+            .finish()
     }
 }
 

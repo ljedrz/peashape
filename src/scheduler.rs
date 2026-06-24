@@ -167,10 +167,14 @@ impl Scheduler {
                 if peers.is_empty() {
                     return;
                 }
-                let frame = self
-                    .shaper
-                    .next_frame()
-                    .unwrap_or_else(|| self.shaper.cover());
+                // A real frame is finalized through the cover generator
+                // (in send order) so a custom generator can sequence it
+                // into the same stream as cover; an empty lane yields a
+                // fresh cover frame.
+                let frame = match self.shaper.next_frame() {
+                    Some(real) => self.shaper.finalize_real(real),
+                    None => self.shaper.cover(),
+                };
                 self.dispatch_global(node, &peers, frame);
             }
             ShapingScope::PerConnection { randomize } => {
@@ -183,10 +187,13 @@ impl Scheduler {
                     return;
                 }
                 let peer = self.pick_round_robin(&peers, randomize);
-                let frame = self
-                    .shaper
-                    .next_frame_for(peer)
-                    .unwrap_or_else(|| self.shaper.cover());
+                // Finalize a real frame (in send order) through the
+                // cover generator so it shares the cover stream's
+                // sequencing; otherwise emit a fresh cover frame.
+                let frame = match self.shaper.next_frame_for(peer) {
+                    Some(real) => self.shaper.finalize_real(real),
+                    None => self.shaper.cover(),
+                };
                 self.send_one_to(node, peer, &frame);
             }
         }

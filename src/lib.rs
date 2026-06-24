@@ -189,7 +189,7 @@ mod scheduler;
 mod shaper;
 
 pub use crate::codec::Codec;
-pub use crate::config::{Lane, ShapeConfig, ShapingScope, ShapingStrategy};
+pub use crate::config::{CoverGenerator, Lane, ShapeConfig, ShapingScope, ShapingStrategy};
 pub use crate::error::Error;
 pub use crate::frame::{build_frame, random_cover, ID_SIZE};
 pub use crate::node::Node;

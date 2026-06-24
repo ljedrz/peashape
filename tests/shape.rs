@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use peashape::{
-    connect_nodes, Lane, Node, ShapeConfig, ShapingScope, ShapingStrategy, Topology, ID_SIZE,
+    connect_nodes, CoverGenerator, Lane, Node, ShapeConfig, ShapingScope, ShapingStrategy,
+    Topology, ID_SIZE,
 };
 
 /// Returns a [`ShapeConfig`] tailored for tests: small messages,
@@ -813,6 +814,136 @@ async fn per_connection_broadcast_reaches_all_peers() {
     alice.shutdown().await;
     bob.shutdown().await;
     carol.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_cover_generator_is_used() {
+    // A node configured with a custom cover generator must emit that
+    // generator's frames (not uniform random cover) when its lanes are
+    // empty. We stamp every cover frame with a recognizable marker and
+    // assert the peer sees it; with no real traffic, every frame is
+    // cover.
+    let marker = b"COVER-GENERATOR-MARKER".to_vec();
+    let stamp = marker.clone();
+    let gen: std::sync::Arc<dyn CoverGenerator> =
+        std::sync::Arc::new(move |config: &ShapeConfig| {
+            let mut f = BytesMut::with_capacity(config.frame_size);
+            f.extend_from_slice(&stamp);
+            f.resize(config.frame_size, 0);
+            f
+        });
+
+    let mut alice_config = test_config(
+        "alice",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(50),
+        },
+        ShapingScope::Global,
+    );
+    alice_config.cover_generator = Some(gen);
+    let alice = Node::new(alice_config);
+    let bob = Node::new(test_config(
+        "bob",
+        ShapingStrategy::Constant {
+            interval: Duration::from_secs(10),
+        },
+        ShapingScope::Global,
+    ));
+
+    alice.spawn().await.unwrap();
+    bob.spawn().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let bob_addr = bob.local_addr().await.unwrap();
+    alice.connect(bob_addr).await.unwrap();
+    assert!(wait_connected(&alice, bob_addr).await);
+
+    let mut rx = bob.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut got = false;
+    while !got && Instant::now() < deadline {
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            // The custom generator's marker is at the front of the frame.
+            if buf.starts_with(&marker[..]) {
+                got = true;
+            }
+        }
+    }
+    assert!(
+        got,
+        "peer never saw a frame from the custom cover generator"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cover_generator_finalizes_real_lane_frames() {
+    // A generator's `finalize_real` hook must be applied to real frames
+    // drained from the priority lanes (not just to cover frames). We
+    // stamp a recognizable marker onto the front of every real frame in
+    // `finalize_real`; cover frames are left blank. The peer must see a
+    // frame carrying the marker, proving a lane frame went through the
+    // hook.
+    struct Stamper(Vec<u8>);
+    impl CoverGenerator for Stamper {
+        fn cover(&self, config: &ShapeConfig) -> BytesMut {
+            let mut f = BytesMut::with_capacity(config.frame_size);
+            f.resize(config.frame_size, 0);
+            f
+        }
+        fn finalize_real(&self, _config: &ShapeConfig, mut frame: BytesMut) -> BytesMut {
+            let n = self.0.len().min(frame.len());
+            frame[..n].copy_from_slice(&self.0[..n]);
+            frame
+        }
+    }
+
+    let marker = b"FINALIZED-REAL-FRAME".to_vec();
+    let mut alice_config = test_config(
+        "alice",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(50),
+        },
+        ShapingScope::Global,
+    );
+    alice_config.cover_generator = Some(std::sync::Arc::new(Stamper(marker.clone())));
+    let alice = Node::new(alice_config);
+    let bob = Node::new(test_config(
+        "bob",
+        ShapingStrategy::Constant {
+            interval: Duration::from_secs(10),
+        },
+        ShapingScope::Global,
+    ));
+
+    alice.spawn().await.unwrap();
+    bob.spawn().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let bob_addr = bob.local_addr().await.unwrap();
+    alice.connect(bob_addr).await.unwrap();
+    assert!(wait_connected(&alice, bob_addr).await);
+
+    let mut rx = bob.subscribe();
+    // Submit a real frame through the high-priority lane; it must be
+    // drained and routed through `finalize_real` before hitting the wire.
+    alice.broadcast_shaped(b"real payload").expect("broadcast");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut got = false;
+    while !got && Instant::now() < deadline {
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+            if buf.starts_with(&marker[..]) {
+                got = true;
+            }
+        }
+    }
+    assert!(got, "a lane frame was never routed through finalize_real");
+
+    alice.shutdown().await;
+    bob.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -166,6 +166,36 @@ The `high_lane_capacity` should be sized to
 `shaping_rate * burst_seconds` to keep submission latency low
 under reasonable bursts.
 
+## Custom cover traffic
+
+By default, cover frames are uniform random bytes. To make the
+*whole* stream — real frames and cover alike — mimic a specific
+wire profile (so a passive observer sees a recognizable protocol
+rather than random padding), supply a `CoverGenerator` via
+`ShapeConfig::cover_generator`:
+
+```rust
+pub trait CoverGenerator: Send + Sync {
+    fn cover(&self, config: &ShapeConfig) -> BytesMut;
+}
+```
+
+A bare `Fn(&ShapeConfig) -> BytesMut` closure implements the
+trait, and the generator must return exactly `frame_size` bytes.
+Because it is shared across threads and called via `&self`, any
+per-frame state (e.g. a sequence counter) needs interior
+mutability. The trait also has a `finalize_real` hook, called on
+each real frame as it drains from a priority lane, so real
+traffic and cover can be folded into one coherently-sequenced
+stream. Two worked examples:
+
+- `cargo run --example webrtc_masquerade` — a 1:1
+  (`PerConnection`) link shaped to look like a WebRTC/RTP call
+  tunneled over TCP.
+- `cargo run --example mpegts_broadcast` — a one-to-many
+  (`Global` fan-out) stream shaped to look like a scrambled
+  MPEG-TS / IPTV multicast.
+
 ## Composition with `peasub`
 
 `peasub` is a metadata-private gossip protocol built on top of

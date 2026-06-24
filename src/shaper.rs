@@ -5,12 +5,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
-use crate::config::{Lane, ShapeConfig, ShapingScope};
+use crate::config::{CoverGenerator, Lane, ShapeConfig, ShapingScope};
 use crate::error::Error;
 use crate::frame::{random_cover, ID_SIZE};
 
@@ -111,6 +112,11 @@ pub struct Shaper {
     /// enqueues. Refreshed by the scheduler on every tick.
     pc_peers: Mutex<Vec<SocketAddr>>,
     shutting_down: AtomicBool,
+    /// The generator consulted to build a cover frame when a tick
+    /// fires with empty lanes. Resolved from
+    /// [`ShapeConfig::cover_generator`], defaulting to
+    /// [`random_cover`].
+    cover_generator: Arc<dyn CoverGenerator>,
 }
 
 impl Shaper {
@@ -138,6 +144,12 @@ impl Shaper {
             config.frame_size,
         );
         let (incoming, _) = broadcast::channel(SUBSCRIBER_CAPACITY);
+        // Resolve the cover generator now: a caller-supplied one, or
+        // the built-in uniform-random default.
+        let cover_generator: Arc<dyn CoverGenerator> = match &config.cover_generator {
+            Some(g) => g.clone(),
+            None => Arc::new(random_cover as fn(&ShapeConfig) -> BytesMut),
+        };
         Self {
             config: config.clone(),
             incoming,
@@ -146,6 +158,7 @@ impl Shaper {
             peer_lanes: Mutex::new(HashMap::new()),
             pc_peers: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
+            cover_generator,
         }
     }
 
@@ -410,13 +423,39 @@ impl Shaper {
         global + per_peer
     }
 
-    /// Returns a freshly-generated cover frame, identical in
-    /// shape to a real one.
+    /// Returns a freshly-generated cover frame, identical in shape to
+    /// a real one. Delegates to the configured [`CoverGenerator`]
+    /// (the uniform-random [`random_cover`] unless a custom one was
+    /// supplied via [`ShapeConfig::cover_generator`]).
     pub fn cover(&self) -> PendingFrame {
+        let bytes = self.cover_generator.cover(&self.config);
+        debug_assert_eq!(
+            bytes.len(),
+            self.config.frame_size,
+            "cover generator returned a frame of the wrong size",
+        );
         PendingFrame {
-            bytes: random_cover(&self.config),
+            bytes,
             target: Target::Broadcast,
         }
+    }
+
+    /// Runs a real (lane-drained) frame through the configured
+    /// [`CoverGenerator`]'s
+    /// [`finalize_real`](CoverGenerator::finalize_real) hook, in send
+    /// order, preserving its delivery target. With the default
+    /// generator this is a no-op; a custom generator can use it to
+    /// sequence real frames into the same stream as cover.
+    pub fn finalize_real(&self, mut frame: PendingFrame) -> PendingFrame {
+        frame.bytes = self
+            .cover_generator
+            .finalize_real(&self.config, frame.bytes);
+        debug_assert_eq!(
+            frame.bytes.len(),
+            self.config.frame_size,
+            "cover generator finalize_real returned a frame of the wrong size",
+        );
+        frame
     }
 
     /// Dispatches a frame received from a peer to all
