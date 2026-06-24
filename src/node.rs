@@ -51,6 +51,8 @@ impl Node {
     /// Panics if the configuration is internally inconsistent:
     ///
     /// - `frame_size == 0` (no message can be encoded);
+    /// - `frame_size < ID_SIZE` (a frame could not hold its
+    ///   identifier prefix);
     /// - `frame_size > max_frame_size` (would be rejected by the
     ///   decoder);
     /// - `high_lane_capacity == 0` or `low_lane_capacity == 0`
@@ -68,6 +70,12 @@ impl Node {
         };
 
         assert!(config.frame_size > 0, "frame_size must be non-zero");
+        assert!(
+            config.frame_size >= ID_SIZE,
+            "frame_size ({} bytes) must be at least ID_SIZE ({ID_SIZE} bytes) \
+             so every frame can carry its identifier prefix",
+            config.frame_size,
+        );
         assert!(
             config.frame_size <= config.max_frame_size,
             "frame_size ({} bytes) must not exceed max_frame_size ({} bytes)",

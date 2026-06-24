@@ -233,6 +233,100 @@ async fn unicast_to_disconnected_peer_is_dropped_silently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnected_unicast_does_not_leak_to_other_peers() {
+    // Regression test: a unicast frame whose target has disconnected
+    // between submission and tick time must be *dropped* — never
+    // broadcast to other peers. Otherwise a payload addressed to one
+    // peer would be delivered to peers it was never meant for. The
+    // tick still emits `fanout` *cover* frames (preserving the rate),
+    // so the only observable difference is that the real marker never
+    // reaches a non-target.
+    let mut alice_config = test_config(
+        "alice",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(25),
+        },
+        ShapingScope::Global,
+    );
+    alice_config.fanout = 3;
+    let alice = Node::new(alice_config);
+
+    // Receivers shape very slowly so their own cover traffic does not
+    // pollute the measurement.
+    let mk = |name: &str| {
+        let mut cfg = test_config(
+            name,
+            ShapingStrategy::Constant {
+                interval: Duration::from_secs(10),
+            },
+            ShapingScope::Global,
+        );
+        cfg.frame_size = 128; // match alice (test_config default)
+        Node::new(cfg)
+    };
+    let carol = mk("carol");
+    let dave = mk("dave");
+    // `ghost` is connected only long enough to learn its address, then
+    // disconnected, so unicasts addressed to it have a gone target.
+    let ghost = mk("ghost");
+
+    alice.spawn().await.unwrap();
+    carol.spawn().await.unwrap();
+    dave.spawn().await.unwrap();
+    ghost.spawn().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let carol_addr = carol.local_addr().await.unwrap();
+    let dave_addr = dave.local_addr().await.unwrap();
+    let ghost_addr = ghost.local_addr().await.unwrap();
+    alice.connect(carol_addr).await.unwrap();
+    alice.connect(dave_addr).await.unwrap();
+    alice.connect(ghost_addr).await.unwrap();
+    assert!(wait_connected(&alice, carol_addr).await);
+    assert!(wait_connected(&alice, dave_addr).await);
+    assert!(wait_connected(&alice, ghost_addr).await);
+
+    // Disconnect ghost, then flood the high lane with unicasts addressed
+    // to it. Every tick that drains one of these finds the target gone.
+    alice.disconnect(ghost_addr).await;
+    let marker = b"peashape-ghost-unicast-marker";
+    for _ in 0..200 {
+        // Lane saturates (bounded); we just want it kept non-empty.
+        let _ = alice.send_shaped(ghost_addr, marker);
+    }
+
+    let mut carol_rx = carol.subscribe();
+    let mut dave_rx = dave.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut leaked = false;
+    while !leaked && Instant::now() < deadline {
+        tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
+                if let Ok(Ok(buf)) = r {
+                    if contains_payload(&buf, marker) { leaked = true; }
+                }
+            }
+            r = tokio::time::timeout(Duration::from_millis(100), dave_rx.recv()) => {
+                if let Ok(Ok(buf)) = r {
+                    if contains_payload(&buf, marker) { leaked = true; }
+                }
+            }
+        }
+    }
+
+    assert!(
+        !leaked,
+        "a unicast to a disconnected peer leaked to a non-target peer; \
+         it must be dropped and replaced with cover"
+    );
+
+    alice.shutdown().await;
+    carol.shutdown().await;
+    dave.shutdown().await;
+    ghost.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn constant_rate_traffic() {
     // Two connected nodes; with a 50 ms cover interval we
     // expect ~20 messages / second in each direction over a 1 s
@@ -568,6 +662,177 @@ async fn per_connection_scope_sends_to_one_peer_per_tick() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_connection_unicast_reaches_only_target() {
+    // In PerConnection scope a unicast is queued on the *target peer's
+    // own* lane and drained on that peer's round-robin slot, so it
+    // reaches the intended peer and no other. A non-target peer sees
+    // only cover, which never matches the marker.
+    let mut alice_config = test_config(
+        "alice",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(25),
+        },
+        ShapingScope::PerConnection { randomize: false },
+    );
+    alice_config.fanout = 1;
+    let alice = Node::new(alice_config);
+
+    let mk = |name: &str| {
+        let mut cfg = test_config(
+            name,
+            ShapingStrategy::Constant {
+                interval: Duration::from_secs(10),
+            },
+            ShapingScope::Global,
+        );
+        cfg.frame_size = 128;
+        Node::new(cfg)
+    };
+    let bob = mk("bob");
+    let carol = mk("carol");
+
+    alice.spawn().await.unwrap();
+    bob.spawn().await.unwrap();
+    carol.spawn().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let bob_addr = bob.local_addr().await.unwrap();
+    let carol_addr = carol.local_addr().await.unwrap();
+    alice.connect(bob_addr).await.unwrap();
+    alice.connect(carol_addr).await.unwrap();
+    assert!(wait_connected(&alice, bob_addr).await);
+    assert!(wait_connected(&alice, carol_addr).await);
+
+    let mut bob_rx = bob.subscribe();
+    let mut carol_rx = carol.subscribe();
+    let marker = b"peashape-pc-unicast-marker";
+    alice.send_shaped(bob_addr, marker).expect("send_shaped");
+
+    // Run the full window so carol has many round-robin slots in which
+    // she could (wrongly) receive the marker.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut bob_got = false;
+    let mut carol_got = false;
+    while Instant::now() < deadline {
+        tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()) => {
+                if let Ok(Ok(buf)) = r {
+                    if contains_payload(&buf, marker) { bob_got = true; }
+                }
+            }
+            r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
+                if let Ok(Ok(buf)) = r {
+                    if contains_payload(&buf, marker) { carol_got = true; }
+                }
+            }
+        }
+    }
+    assert!(
+        bob_got,
+        "target peer never received the PerConnection unicast"
+    );
+    assert!(
+        !carol_got,
+        "a non-target peer received a PerConnection unicast"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    carol.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_connection_broadcast_reaches_all_peers() {
+    // In PerConnection scope `broadcast_shaped` fans a copy of the
+    // frame into every currently-connected peer's lane, so every peer
+    // receives it on its own shaped slot.
+    let alice = Node::new(test_config(
+        "alice",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(25),
+        },
+        ShapingScope::PerConnection { randomize: false },
+    ));
+
+    let mk = |name: &str| {
+        let mut cfg = test_config(
+            name,
+            ShapingStrategy::Constant {
+                interval: Duration::from_secs(10),
+            },
+            ShapingScope::Global,
+        );
+        cfg.frame_size = 128;
+        Node::new(cfg)
+    };
+    let bob = mk("bob");
+    let carol = mk("carol");
+
+    alice.spawn().await.unwrap();
+    bob.spawn().await.unwrap();
+    carol.spawn().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let bob_addr = bob.local_addr().await.unwrap();
+    let carol_addr = carol.local_addr().await.unwrap();
+    alice.connect(bob_addr).await.unwrap();
+    alice.connect(carol_addr).await.unwrap();
+    assert!(wait_connected(&alice, bob_addr).await);
+    assert!(wait_connected(&alice, carol_addr).await);
+
+    let mut bob_rx = bob.subscribe();
+    let mut carol_rx = carol.subscribe();
+    // The broadcast fan-out consults the scheduler-maintained peer
+    // cache; give it a couple of ticks to learn about both peers.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let marker = b"peashape-pc-broadcast-marker";
+    alice.broadcast_shaped(marker).expect("broadcast_shaped");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut bob_got = false;
+    let mut carol_got = false;
+    while !(bob_got && carol_got) && Instant::now() < deadline {
+        tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()) => {
+                if let Ok(Ok(buf)) = r {
+                    if contains_payload(&buf, marker) { bob_got = true; }
+                }
+            }
+            r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
+                if let Ok(Ok(buf)) = r {
+                    if contains_payload(&buf, marker) { carol_got = true; }
+                }
+            }
+        }
+    }
+    assert!(
+        bob_got && carol_got,
+        "PerConnection broadcast did not reach all peers (bob={bob_got}, carol={carol_got})"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    carol.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[should_panic(expected = "at least ID_SIZE")]
+async fn frame_size_below_id_size_panics() {
+    // A frame must be able to hold its ID prefix; constructing a node
+    // with `frame_size < ID_SIZE` must fail loudly rather than letting
+    // the framing helpers underflow at runtime.
+    let mut config = test_config(
+        "node",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(50),
+        },
+        ShapingScope::Global,
+    );
+    config.frame_size = ID_SIZE - 1;
+    let _ = Node::new(config);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frame_size_is_constant() {
     // Every frame observed on the wire should be exactly
     // `frame_size` bytes, regardless of payload size.
@@ -712,4 +977,108 @@ async fn lane_re_export_works() {
     let _ = Lane::High;
     let _ = Lane::Low;
     assert_ne!(Lane::High, Lane::Low);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_connection_unicast_does_not_starve_other_links() {
+    // Regression test for the per-tick frame-count invariant under
+    // `Global` scope: a tick that drains a real *unicast* frame must
+    // still put `fanout` frames on the wire (the real one to the
+    // recipient, cover to the rest), exactly like a cover or
+    // broadcast tick. If unicast ticks emitted only a single frame,
+    // a passive observer counting frames per tick could pick out
+    // precisely which ticks carried real unicast traffic — and to
+    // whom. Concretely: if Alice spends every tick sending a unicast
+    // to Bob, the *other* peers (Carol, Dave) must keep receiving
+    // cover at the full shaping rate rather than being starved.
+    let mut alice_config = test_config(
+        "alice",
+        ShapingStrategy::Constant {
+            interval: Duration::from_millis(25),
+        },
+        ShapingScope::Global,
+    );
+    alice_config.fanout = 3;
+    let alice = Node::new(alice_config);
+
+    // The receivers shape very slowly so their own cover traffic
+    // does not pollute the measurement; what we count at Carol and
+    // Dave is essentially all driven by Alice's schedule.
+    let mk_receiver = |name: &str| {
+        let mut cfg = test_config(
+            name,
+            ShapingStrategy::Constant {
+                interval: Duration::from_secs(10),
+            },
+            ShapingScope::Global,
+        );
+        cfg.frame_size = 128; // match alice (test_config default)
+        Node::new(cfg)
+    };
+    let bob = mk_receiver("bob");
+    let carol = mk_receiver("carol");
+    let dave = mk_receiver("dave");
+
+    alice.spawn().await.unwrap();
+    bob.spawn().await.unwrap();
+    carol.spawn().await.unwrap();
+    dave.spawn().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let bob_addr = bob.local_addr().await.unwrap();
+    let carol_addr = carol.local_addr().await.unwrap();
+    let dave_addr = dave.local_addr().await.unwrap();
+    alice.connect(bob_addr).await.unwrap();
+    alice.connect(carol_addr).await.unwrap();
+    alice.connect(dave_addr).await.unwrap();
+    assert!(wait_connected(&alice, bob_addr).await);
+    assert!(wait_connected(&alice, carol_addr).await);
+    assert!(wait_connected(&alice, dave_addr).await);
+
+    // Keep the high lane full of Bob-targeted unicasts so that
+    // essentially every tick in the measurement window drains a
+    // real unicast (not a fallback cover broadcast).
+    for _ in 0..120 {
+        // Ignore LaneFull once the (bounded) lane saturates; we just
+        // want it kept non-empty across the window.
+        let _ = alice.send_shaped(bob_addr, b"unicast-to-bob");
+    }
+
+    let mut carol_rx = carol.subscribe();
+    let mut dave_rx = dave.subscribe();
+    let start = Instant::now();
+    let mut carol_count = 0usize;
+    let mut dave_count = 0usize;
+    while start.elapsed() < Duration::from_millis(1500) {
+        tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
+                if r.is_ok() { carol_count += 1; }
+            }
+            r = tokio::time::timeout(Duration::from_millis(100), dave_rx.recv()) => {
+                if r.is_ok() { dave_count += 1; }
+            }
+        }
+    }
+
+    // With a 25 ms interval over ~1.5 s there are ~60 ticks. Under
+    // the fixed behavior each unicast tick also sends cover to both
+    // non-target peers, so Carol and Dave should each see many
+    // frames. Under the buggy behavior (unicast tick -> Bob only)
+    // they would each see ~0. A generous lower bound cleanly
+    // separates the two.
+    assert!(
+        carol_count >= 10,
+        "carol was starved of cover while alice unicast to bob (got {carol_count}); \
+         a Global unicast tick must still emit fanout frames"
+    );
+    assert!(
+        dave_count >= 10,
+        "dave was starved of cover while alice unicast to bob (got {dave_count}); \
+         a Global unicast tick must still emit fanout frames"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    carol.shutdown().await;
+    dave.shutdown().await;
 }

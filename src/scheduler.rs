@@ -107,10 +107,28 @@ impl Scheduler {
                 // Inter-arrival time for a Poisson process of rate
                 // `rate` is Exp(rate). Sample via inverse-CDF:
                 // -ln(U) / rate, where U is uniform in (0, 1).
-                // We clamp the upper end so a single
-                // astronomically-large draw cannot stall shutdown.
+                //
+                // We bound a single pathological draw (U very close
+                // to 0 yields an enormous interval, which could push
+                // `from_secs_f64` toward overflow). Shutdown latency
+                // is *not* a concern here — the `select!` below wakes
+                // the task immediately via `self.wake`, regardless of
+                // how long the sleep was scheduled for.
+                //
+                // The bound is scaled to the configured rate
+                // (`MAX_INTERVAL_FACTOR / rate`, i.e. a fixed multiple
+                // of the mean inter-arrival) rather than a flat number
+                // of seconds. A flat cap would silently truncate most
+                // of the distribution at low rates (e.g. a 60 s cap on
+                // a rate of 0.01/s — mean 100 s — discards the bulk of
+                // the mass and the emitted process is no longer
+                // Poisson). Scaling keeps the truncated tail mass at a
+                // negligible `exp(-MAX_INTERVAL_FACTOR)` for every
+                // rate, so the observed process is Poisson to within
+                // that vanishingly small tail.
+                const MAX_INTERVAL_FACTOR: f64 = 40.0; // exp(-40) ~ 4e-18
                 let u: f64 = rng.random::<f64>().clamp(f64::MIN_POSITIVE, 1.0);
-                let secs = (-u.ln() / rate).min(60.0);
+                let secs = (-u.ln() / rate).min(MAX_INTERVAL_FACTOR / rate);
                 Duration::from_secs_f64(secs)
             };
 
@@ -129,54 +147,114 @@ impl Scheduler {
         self.shaper.shutting_down().load(Ordering::SeqCst)
     }
 
-    /// Pull the next frame (real or cover) and ship it according
-    /// to the configured [`ShapingScope`].
+    /// Pull and ship the frame(s) for one tick, according to the
+    /// configured [`ShapingScope`].
+    ///
+    /// - [`ShapingScope::Global`]: drain the single shared lane and
+    ///   fan the frame out (see [`Scheduler::dispatch_global`]).
+    /// - [`ShapingScope::PerConnection`]: select the peer whose turn
+    ///   it is and send exactly one frame *to that peer* — a real
+    ///   frame from that peer's own lane if one is waiting, otherwise
+    ///   cover. Because the scheduled *peer* (not the queued frame)
+    ///   drives selection, a real frame for that peer simply occupies
+    ///   the cover slot its link was going to emit anyway, so it is
+    ///   indistinguishable on that link from pure cover. There is no
+    ///   off-schedule transmission and no peer is ever skipped.
     async fn send_one(&self, node: &Node) {
         let peers = node.connected_peers();
-        if peers.is_empty() {
-            return;
-        }
-
-        let frame = self
-            .shaper
-            .next_frame()
-            .unwrap_or_else(|| self.shaper.cover());
-        self.dispatch(node, &peers, frame);
-    }
-
-    /// Dispatch a frame to its destination(s).
-    ///
-    /// Honors a `Target::Unicast` first: if the target peer is
-    /// connected, the frame is sent there. If the target peer
-    /// has disconnected between submission and tick time, the
-    /// frame falls through to the scope-based dispatch (so the
-    /// shaping rate is still maintained — the user expected a
-    /// frame to go out on this tick, and a best-effort
-    /// broadcast is preferable to silently dropping user data).
-    fn dispatch(&self, node: &Node, peers: &[SocketAddr], frame: PendingFrame) {
-        if let Target::Unicast(peer) = &frame.target {
-            if peers.contains(peer) {
-                self.send_one_to(node, *peer, &frame);
-                return;
-            }
-            // The target peer disconnected between submission
-            // and the tick that drains the lane. Fall through
-            // to scope-based dispatch (best-effort).
-            debug!(
-                parent: node.node().span(),
-                "unicast target {peer} is no longer connected; falling back to scope-based dispatch"
-            );
-        }
         match self.shaper.config().scope {
             ShapingScope::Global => {
-                let fanout = self.shaper.config().fanout.min(peers.len()).max(1);
+                if peers.is_empty() {
+                    return;
+                }
+                let frame = self
+                    .shaper
+                    .next_frame()
+                    .unwrap_or_else(|| self.shaper.cover());
+                self.dispatch_global(node, &peers, frame);
+            }
+            ShapingScope::PerConnection { randomize } => {
+                // Keep the per-connection bookkeeping in step with the
+                // live connection set: refresh the cache that broadcast
+                // fan-out consults, and discard lanes for departed peers.
+                self.shaper.refresh_pc_peers(&peers);
+                self.shaper.prune_peer_lanes(&peers);
+                if peers.is_empty() {
+                    return;
+                }
+                let peer = self.pick_round_robin(&peers, randomize);
+                let frame = self
+                    .shaper
+                    .next_frame_for(peer)
+                    .unwrap_or_else(|| self.shaper.cover());
+                self.send_one_to(node, peer, &frame);
+            }
+        }
+    }
+
+    /// Dispatch a [`ShapingScope::Global`] frame to its
+    /// destination(s).
+    ///
+    /// The cardinal rule is that the *number* of frames a tick
+    /// puts on the wire must not depend on whether the drained
+    /// frame is real or cover, nor on whether it is unicast or
+    /// broadcast — otherwise a passive observer counting frames
+    /// per tick could pick out the ticks that carried real
+    /// unicast traffic (and their recipient). So every tick emits
+    /// exactly `fanout` frames: for a [`Target::Broadcast`] frame
+    /// those are `fanout` copies of the (real or cover) frame; for
+    /// a [`Target::Unicast`] frame, the real frame goes to its
+    /// recipient and the remaining `fanout - 1` slots are filled
+    /// with freshly-generated cover to *other* peers.
+    ///
+    /// If a unicast target has disconnected between submission and
+    /// tick time, the real frame is dropped — it must never be
+    /// delivered to a peer it was not addressed to — and the tick
+    /// emits `fanout` freshly-generated cover frames instead, so the
+    /// on-the-wire frame count for the tick is unchanged.
+    ///
+    /// Note: under `Global` scope a *residual* aggregate signal
+    /// remains — a peer that is the recipient of sustained unicast
+    /// traffic receives frames at a marginally higher long-run rate
+    /// than its cover-only share. This is inherent to carrying
+    /// unicast over a gossip-style fanout; [`ShapingScope::PerConnection`]
+    /// avoids it entirely (a real frame merely replaces a cover
+    /// frame on the recipient's already-constant stream), and is
+    /// the recommended scope for unicast-heavy workloads.
+    fn dispatch_global(&self, node: &Node, peers: &[SocketAddr], frame: PendingFrame) {
+        let fanout = self.shaper.config().fanout.min(peers.len()).max(1);
+        match &frame.target {
+            // Unicast to a still-connected peer: real frame to the
+            // recipient, cover to the remaining slots so the tick still
+            // emits exactly `fanout` frames.
+            Target::Unicast(peer) if peers.contains(peer) => {
+                let target = *peer;
+                self.send_one_to(node, target, &frame);
+                let others: Vec<SocketAddr> =
+                    peers.iter().copied().filter(|p| *p != target).collect();
+                let cover_n = fanout.saturating_sub(1).min(others.len());
+                for peer in self.pick_targets(&others, cover_n) {
+                    self.send_one_to(node, peer, &self.shaper.cover());
+                }
+            }
+            // Unicast whose target has disconnected between submission
+            // and tick time: drop the real payload (it must never reach
+            // a peer it was not addressed to) and emit `fanout` cover
+            // frames so the tick's on-the-wire frame count is unchanged.
+            Target::Unicast(peer) => {
+                debug!(
+                    parent: node.node().span(),
+                    "unicast target {peer} is no longer connected; dropping the frame and emitting cover"
+                );
+                for peer in self.pick_targets(peers, fanout) {
+                    self.send_one_to(node, peer, &self.shaper.cover());
+                }
+            }
+            // Broadcast: the (real or cover) frame goes to `fanout` peers.
+            Target::Broadcast => {
                 for peer in self.pick_targets(peers, fanout) {
                     self.send_one_to(node, peer, &frame);
                 }
-            }
-            ShapingScope::PerConnection { randomize } => {
-                let pick = self.pick_round_robin(peers, randomize);
-                self.send_one_to(node, pick, &frame);
             }
         }
     }

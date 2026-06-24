@@ -2,7 +2,7 @@
 //!
 //! [`Node`]: crate::Node
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 
@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
-use crate::config::{Lane, ShapeConfig};
+use crate::config::{Lane, ShapeConfig, ShapingScope};
 use crate::error::Error;
 use crate::frame::{random_cover, ID_SIZE};
 
@@ -51,6 +51,16 @@ pub struct PendingFrame {
     pub target: Target,
 }
 
+/// The pair of priority lanes maintained for a single peer in
+/// [`ShapingScope::PerConnection`] mode. Same disciplines as the
+/// global lanes: `high` is a bounded FIFO, `low` is a LIFO with
+/// drop-oldest eviction.
+#[derive(Default)]
+struct PeerLanes {
+    high: VecDeque<PendingFrame>,
+    low: VecDeque<PendingFrame>,
+}
+
 /// The shared, node-wide state that backs every clone of a
 /// [`Node`].
 ///
@@ -75,6 +85,18 @@ pub struct PendingFrame {
 /// through the same channel, because on the wire they are
 /// indistinguishable.
 ///
+/// # Per-connection lanes
+///
+/// In [`ShapingScope::PerConnection`] mode the global `high_lane`
+/// and `low_lane` are *not* used. Instead each peer gets its own
+/// pair of lanes (`peer_lanes`), drained on that peer's scheduled
+/// slot, so a real frame for a peer simply occupies the cover slot
+/// that peer's link was going to emit anyway. `pc_peers` caches the
+/// most recent connected-peer set (refreshed by the scheduler each
+/// tick) so that a `Broadcast` enqueue can fan a copy into every
+/// peer's lane without the shaper needing direct access to the
+/// `pea2pea` node.
+///
 /// [`Node`]: crate::Node
 /// [`Error::LaneFull`]: crate::Error::LaneFull
 pub struct Shaper {
@@ -82,6 +104,12 @@ pub struct Shaper {
     incoming: broadcast::Sender<BytesMut>,
     high_lane: Mutex<VecDeque<PendingFrame>>,
     low_lane: Mutex<VecDeque<PendingFrame>>,
+    /// Per-peer lanes, used only in [`ShapingScope::PerConnection`].
+    peer_lanes: Mutex<HashMap<SocketAddr, PeerLanes>>,
+    /// Most-recent connected-peer snapshot, used only in
+    /// [`ShapingScope::PerConnection`] to fan out `Broadcast`
+    /// enqueues. Refreshed by the scheduler on every tick.
+    pc_peers: Mutex<Vec<SocketAddr>>,
     shutting_down: AtomicBool,
 }
 
@@ -92,7 +120,9 @@ impl Shaper {
     ///
     /// Panics if `config.high_lane_capacity` or
     /// `config.low_lane_capacity` is `0` (no buffering is
-    /// possible).
+    /// possible), or if `config.frame_size < ID_SIZE` (a frame
+    /// could not hold its identifier prefix; the framing helpers
+    /// would underflow).
     pub fn new(config: &ShapeConfig) -> Self {
         assert!(
             config.high_lane_capacity > 0,
@@ -102,12 +132,19 @@ impl Shaper {
             config.low_lane_capacity > 0,
             "low_lane_capacity must be non-zero",
         );
+        assert!(
+            config.frame_size >= ID_SIZE,
+            "frame_size ({} bytes) must be at least ID_SIZE ({ID_SIZE} bytes)",
+            config.frame_size,
+        );
         let (incoming, _) = broadcast::channel(SUBSCRIBER_CAPACITY);
         Self {
             config: config.clone(),
             incoming,
             high_lane: Mutex::new(VecDeque::with_capacity(config.high_lane_capacity)),
             low_lane: Mutex::new(VecDeque::with_capacity(config.low_lane_capacity)),
+            peer_lanes: Mutex::new(HashMap::new()),
+            pc_peers: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -190,7 +227,10 @@ impl Shaper {
     /// - [`Error::FrameSizeMismatch`] if `frame.len() !=
     ///   frame_size`.
     /// - [`Error::LaneFull`] if the high-priority lane is at
-    ///   capacity (only possible with `lane == Lane::High`).
+    ///   capacity (only possible with `lane == Lane::High` and a
+    ///   `Unicast`/global enqueue; `Broadcast` fan-out in
+    ///   `PerConnection` mode is best-effort and never returns
+    ///   `LaneFull`).
     pub fn enqueue_raw(&self, lane: Lane, target: Target, frame: BytesMut) -> Result<(), Error> {
         if frame.len() != self.config.frame_size {
             return Err(Error::FrameSizeMismatch {
@@ -198,10 +238,31 @@ impl Shaper {
                 expected: self.config.frame_size,
             });
         }
-        let pframe = PendingFrame {
-            bytes: frame,
-            target,
-        };
+        match self.config.scope {
+            // Global scope: one shared pair of lanes; the scheduler
+            // decides fanout/recipients at dispatch time.
+            ShapingScope::Global => self.push_global(
+                lane,
+                PendingFrame {
+                    bytes: frame,
+                    target,
+                },
+            ),
+            // Per-connection scope: route the frame to the lane(s) of
+            // the peer(s) it is destined for. The scheduler drains
+            // each peer's lane on that peer's own scheduled slot.
+            ShapingScope::PerConnection { .. } => match target {
+                Target::Unicast(peer) => self.push_peer(peer, lane, frame),
+                Target::Broadcast => {
+                    self.fan_out_per_connection(lane, frame);
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// Push a frame onto the shared (global-scope) lanes.
+    fn push_global(&self, lane: Lane, pframe: PendingFrame) -> Result<(), Error> {
         match lane {
             Lane::High => {
                 let mut l = self.high_lane.lock();
@@ -221,6 +282,69 @@ impl Shaper {
         Ok(())
     }
 
+    /// Push a unicast frame onto a single peer's per-connection
+    /// lane (PerConnection scope). High is bounded FIFO
+    /// ([`Error::LaneFull`] when full); Low is LIFO with
+    /// drop-oldest.
+    fn push_peer(&self, peer: SocketAddr, lane: Lane, frame: BytesMut) -> Result<(), Error> {
+        let pframe = PendingFrame {
+            bytes: frame,
+            target: Target::Unicast(peer),
+        };
+        let mut map = self.peer_lanes.lock();
+        let lanes = map.entry(peer).or_default();
+        match lane {
+            Lane::High => {
+                if lanes.high.len() >= self.config.high_lane_capacity {
+                    return Err(Error::LaneFull);
+                }
+                lanes.high.push_back(pframe);
+            }
+            Lane::Low => {
+                while lanes.low.len() >= self.config.low_lane_capacity {
+                    lanes.low.pop_back();
+                }
+                lanes.low.push_front(pframe);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fan a broadcast frame into every cached peer's per-connection
+    /// lane (PerConnection scope). Best-effort: a peer whose lane is
+    /// full has its oldest queued frame evicted to make room rather
+    /// than failing the whole broadcast, so no recipient can stall
+    /// delivery to the others. Peers that connect *after* this call
+    /// will not receive this particular frame.
+    fn fan_out_per_connection(&self, lane: Lane, frame: BytesMut) {
+        let peers = self.pc_peers.lock().clone();
+        if peers.is_empty() {
+            return;
+        }
+        let mut map = self.peer_lanes.lock();
+        for peer in peers {
+            let pframe = PendingFrame {
+                bytes: frame.clone(),
+                target: Target::Unicast(peer),
+            };
+            let lanes = map.entry(peer).or_default();
+            match lane {
+                Lane::High => {
+                    while lanes.high.len() >= self.config.high_lane_capacity {
+                        lanes.high.pop_front();
+                    }
+                    lanes.high.push_back(pframe);
+                }
+                Lane::Low => {
+                    while lanes.low.len() >= self.config.low_lane_capacity {
+                        lanes.low.pop_back();
+                    }
+                    lanes.low.push_front(pframe);
+                }
+            }
+        }
+    }
+
     /// Returns the next frame to put on the wire, *or* `None` if
     /// both lanes are empty and the caller should generate
     /// cover.
@@ -234,10 +358,56 @@ impl Shaper {
         self.low_lane.lock().pop_front()
     }
 
-    /// Returns the total number of frames currently queued in
-    /// both lanes.
+    /// Returns the next frame to put on the wire for `peer`
+    /// (PerConnection scope), draining that peer's own high lane
+    /// first and then its low lane, or `None` if the peer has no
+    /// queued frames and the caller should generate cover.
+    pub fn next_frame_for(&self, peer: SocketAddr) -> Option<PendingFrame> {
+        let mut map = self.peer_lanes.lock();
+        let lanes = map.get_mut(&peer)?;
+        if let Some(f) = lanes.high.pop_front() {
+            return Some(f);
+        }
+        lanes.low.pop_front()
+    }
+
+    /// Refreshes the cached connected-peer set consulted by
+    /// `Broadcast` fan-out in [`ShapingScope::PerConnection`] mode.
+    /// Called by the scheduler on every tick.
+    pub fn refresh_pc_peers(&self, peers: &[SocketAddr]) {
+        let mut cache = self.pc_peers.lock();
+        cache.clear();
+        cache.extend_from_slice(peers);
+    }
+
+    /// Drops the per-connection lanes of any peer not in
+    /// `connected`, so queued frames for a departed peer are
+    /// discarded (mirroring the global-scope behavior, where a
+    /// unicast to a disconnected peer is dropped) and the map does
+    /// not grow without bound. Called by the scheduler on every
+    /// tick in [`ShapingScope::PerConnection`] mode.
+    pub fn prune_peer_lanes(&self, connected: &[SocketAddr]) {
+        let mut map = self.peer_lanes.lock();
+        if map.is_empty() {
+            return;
+        }
+        let keep: HashSet<SocketAddr> = connected.iter().copied().collect();
+        map.retain(|addr, _| keep.contains(addr));
+    }
+
+    /// Returns the total number of frames currently queued, across
+    /// both the global lanes (Global scope) and all per-connection
+    /// lanes (PerConnection scope). Only one of the two sets is
+    /// populated for a given node, so this is simply their sum.
     pub fn queued(&self) -> usize {
-        self.high_lane.lock().len() + self.low_lane.lock().len()
+        let global = self.high_lane.lock().len() + self.low_lane.lock().len();
+        let per_peer: usize = self
+            .peer_lanes
+            .lock()
+            .values()
+            .map(|l| l.high.len() + l.low.len())
+            .sum();
+        global + per_peer
     }
 
     /// Returns a freshly-generated cover frame, identical in

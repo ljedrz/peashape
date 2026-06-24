@@ -208,12 +208,37 @@ pub enum ShapingScope {
     /// destinations.
     Global,
 
-    /// One ticker per connection. Every tick, one frame is sent to
-    /// a single peer, with peers selected round-robin (optionally
-    /// with a per-tick random offset to avoid two adjacent nodes
-    /// choosing the same "next" peer in lockstep).
+    /// A single node-wide ticker that serves one peer per tick.
     ///
-    /// `fanout` is irrelevant in this mode (clamped to 1).
+    /// On each tick the scheduler selects one connected peer
+    /// (round-robin, optionally mixed with a per-tick random offset)
+    /// and sends it exactly one frame: a real frame drawn from
+    /// *that peer's own* priority lanes if one is waiting, otherwise
+    /// cover. Each peer therefore sees a steady, application-
+    /// independent stream — a real message destined for a peer
+    /// simply occupies the cover slot that peer's link was going to
+    /// emit anyway, so it is indistinguishable on that link from
+    /// pure cover. This is the natural choice for point-to-point
+    /// shaped links (e.g. a private RPC channel) and for any
+    /// unicast-heavy workload.
+    ///
+    /// Because one shared ticker is multiplexed across peers, the
+    /// per-link interval is the configured interval times the number
+    /// of connected peers; a peer's effective rate therefore drops
+    /// as more peers connect (and rises as they leave). An observer
+    /// of a single link sees that link's constant rate change only
+    /// with the node's *connection count* — never with application
+    /// activity. A unicast submitted for a peer waits for that peer's
+    /// next slot (bounded by `peers * interval`), occupying it in
+    /// place of cover.
+    ///
+    /// `broadcast_shaped` in this mode fans a copy of the frame into
+    /// every currently-connected peer's lane at submit time, so the
+    /// message rides out on each peer's own shaped stream; peers that
+    /// connect afterwards do not receive that particular frame, and
+    /// per-link delivery is best-effort (a saturated link evicts its
+    /// oldest queued frame rather than blocking the others). `fanout`
+    /// is irrelevant in this mode.
     PerConnection {
         /// Whether to mix the round-robin cursor with a
         /// per-pick random offset (so two adjacent nodes
