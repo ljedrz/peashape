@@ -9,6 +9,17 @@
 //! recognizable payload format, and handle the ones that are
 //! real.
 //!
+//! PRIVACY NOTE: for clarity this example marks real frames
+//! with a *plaintext* magic header, which is visible on the
+//! wire — a passive observer could use it to tell real frames
+//! from cover, defeating the metadata-privacy property. It is
+//! fine for understanding the mechanics, but a real deployment
+//! must make the payload indistinguishable from random by
+//! encrypting it (authenticated encryption: a frame that fails
+//! to authenticate is cover). The `webrtc_masquerade` and
+//! `mpegts_broadcast` examples show payloads that look random
+//! on the wire.
+//!
 //! Run with: cargo run --example two_nodes
 
 use std::time::Duration;
