@@ -1,6 +1,6 @@
 [package]
 name = "peashape"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR CC0-1.0"
 description = "A traffic-shaping middleware for pea2pea nodes: constant-rate or Poisson outbound traffic, automatic frame padding, and priority lanes for cover traffic."
