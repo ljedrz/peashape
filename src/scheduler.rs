@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::Notify;
 use tokio::time;
 use tracing::debug;

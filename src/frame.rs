@@ -1,7 +1,7 @@
 //! Frame-construction helpers and the on-the-wire ID convention.
 
 use bytes::{BufMut, BytesMut};
-use rand::Rng;
+use rand::RngExt;
 
 use crate::config::ShapeConfig;
 

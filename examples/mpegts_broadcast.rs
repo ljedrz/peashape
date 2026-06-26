@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::broadcast::error::TryRecvError;
 
 use peashape::{CoverGenerator, Lane, Node, ShapeConfig, ShapingScope, ShapingStrategy, Target};

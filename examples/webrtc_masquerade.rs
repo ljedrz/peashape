@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
-use rand::Rng;
+use rand::RngExt;
 
 use peashape::{CoverGenerator, Lane, Node, ShapeConfig, ShapingScope, ShapingStrategy, Target};
 
