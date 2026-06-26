@@ -4,8 +4,8 @@
 //! [`Node`]: crate::Node
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -17,7 +17,7 @@ use tracing::debug;
 use crate::config::{ShapingScope, ShapingStrategy};
 use crate::node::Node;
 use crate::shaper::{PendingFrame, Shaper, Target};
-use pea2pea::{protocols::Writing, Pea2Pea};
+use pea2pea::{Pea2Pea, protocols::Writing};
 
 /// The background task that drains a [`Shaper`] at the configured
 /// rate, picking one frame per tick (real if any are queued, cover

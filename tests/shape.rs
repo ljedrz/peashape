@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use peashape::{
-    connect_nodes, CoverGenerator, Lane, Node, ShapeConfig, ShapingScope, ShapingStrategy,
-    Topology, ID_SIZE,
+    CoverGenerator, ID_SIZE, Lane, Node, ShapeConfig, ShapingScope, ShapingStrategy, Topology,
+    connect_nodes,
 };
 
 /// Returns a [`ShapeConfig`] tailored for tests: small messages,
@@ -87,10 +87,10 @@ async fn unicast_real_message_arrives() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut got = false;
     while !got && Instant::now() < deadline {
-        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()).await {
-            if contains_payload(&buf, &marker) {
-                got = true;
-            }
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()).await
+            && contains_payload(&buf, &marker)
+        {
+            got = true;
         }
     }
     assert!(
@@ -151,13 +151,13 @@ async fn unicast_to_one_peer() {
             if (i == 0 && bob_got) || (i == 1 && carol_got) {
                 continue;
             }
-            if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-                if contains_payload(&buf, &marker) {
-                    if i == 0 {
-                        bob_got = true;
-                    } else {
-                        carol_got = true;
-                    }
+            if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+                && contains_payload(&buf, &marker)
+            {
+                if i == 0 {
+                    bob_got = true;
+                } else {
+                    carol_got = true;
                 }
             }
         }
@@ -303,13 +303,17 @@ async fn disconnected_unicast_does_not_leak_to_other_peers() {
     while !leaked && Instant::now() < deadline {
         tokio::select! {
             r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
-                if let Ok(Ok(buf)) = r {
-                    if contains_payload(&buf, marker) { leaked = true; }
+                if let Ok(Ok(buf)) = r
+                    && contains_payload(&buf, marker)
+                {
+                    leaked = true;
                 }
             }
             r = tokio::time::timeout(Duration::from_millis(100), dave_rx.recv()) => {
-                if let Ok(Ok(buf)) = r {
-                    if contains_payload(&buf, marker) { leaked = true; }
+                if let Ok(Ok(buf)) = r
+                    && contains_payload(&buf, marker)
+                {
+                    leaked = true;
                 }
             }
         }
@@ -717,13 +721,17 @@ async fn per_connection_unicast_reaches_only_target() {
     while Instant::now() < deadline {
         tokio::select! {
             r = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()) => {
-                if let Ok(Ok(buf)) = r {
-                    if contains_payload(&buf, marker) { bob_got = true; }
+                if let Ok(Ok(buf)) = r
+                    && contains_payload(&buf, marker)
+                {
+                    bob_got = true;
                 }
             }
             r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
-                if let Ok(Ok(buf)) = r {
-                    if contains_payload(&buf, marker) { carol_got = true; }
+                if let Ok(Ok(buf)) = r
+                    && contains_payload(&buf, marker)
+                {
+                    carol_got = true;
                 }
             }
         }
@@ -795,13 +803,17 @@ async fn per_connection_broadcast_reaches_all_peers() {
     while !(bob_got && carol_got) && Instant::now() < deadline {
         tokio::select! {
             r = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()) => {
-                if let Ok(Ok(buf)) = r {
-                    if contains_payload(&buf, marker) { bob_got = true; }
+                if let Ok(Ok(buf)) = r
+                    && contains_payload(&buf, marker)
+                {
+                    bob_got = true;
                 }
             }
             r = tokio::time::timeout(Duration::from_millis(100), carol_rx.recv()) => {
-                if let Ok(Ok(buf)) = r {
-                    if contains_payload(&buf, marker) { carol_got = true; }
+                if let Ok(Ok(buf)) = r
+                    && contains_payload(&buf, marker)
+                {
+                    carol_got = true;
                 }
             }
         }
@@ -825,7 +837,7 @@ async fn custom_cover_generator_is_used() {
     // cover.
     let marker = b"COVER-GENERATOR-MARKER".to_vec();
     let stamp = marker.clone();
-    let gen: std::sync::Arc<dyn CoverGenerator> =
+    let generator: std::sync::Arc<dyn CoverGenerator> =
         std::sync::Arc::new(move |config: &ShapeConfig| {
             let mut f = BytesMut::with_capacity(config.frame_size);
             f.extend_from_slice(&stamp);
@@ -840,7 +852,7 @@ async fn custom_cover_generator_is_used() {
         },
         ShapingScope::Global,
     );
-    alice_config.cover_generator = Some(gen);
+    alice_config.cover_generator = Some(generator);
     let alice = Node::new(alice_config);
     let bob = Node::new(test_config(
         "bob",
@@ -934,10 +946,10 @@ async fn cover_generator_finalizes_real_lane_frames() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut got = false;
     while !got && Instant::now() < deadline {
-        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-            if buf.starts_with(&marker[..]) {
-                got = true;
-            }
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+            && buf.starts_with(&marker[..])
+        {
+            got = true;
         }
     }
     assert!(got, "a lane frame was never routed through finalize_real");
@@ -1064,10 +1076,10 @@ async fn relay_shaped_re_broadcasts_pre_built_frame() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut got = false;
     while !got && Instant::now() < deadline {
-        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()).await {
-            if buf == frame {
-                got = true;
-            }
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(100), bob_rx.recv()).await
+            && buf == frame
+        {
+            got = true;
         }
     }
     assert!(got, "bob never received the relayed frame");

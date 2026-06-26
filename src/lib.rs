@@ -203,11 +203,11 @@ mod shaper;
 pub use crate::codec::Codec;
 pub use crate::config::{CoverGenerator, Lane, ShapeConfig, ShapingScope, ShapingStrategy};
 pub use crate::error::Error;
-pub use crate::frame::{build_frame, random_cover, ID_SIZE};
+pub use crate::frame::{ID_SIZE, build_frame, random_cover};
 pub use crate::node::Node;
 pub use crate::scheduler::Scheduler;
-pub use crate::shaper::{PendingFrame, Shaper, Target, SUBSCRIBER_CAPACITY};
+pub use crate::shaper::{PendingFrame, SUBSCRIBER_CAPACITY, Shaper, Target};
 
 /// Re-exported so that callers can wire up a topology in tests
 /// without adding `pea2pea` as a direct dependency.
-pub use pea2pea::{self, connect_nodes, Topology};
+pub use pea2pea::{self, Topology, connect_nodes};

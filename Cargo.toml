@@ -1,13 +1,17 @@
 [package]
 name = "peashape"
 version = "0.2.0"
-edition = "2021"
-license = "MIT OR CC0-1.0"
+authors = ["ljedrz <ljedrz@gmail.com>"]
+edition = "2024"
 description = "A traffic-shaping middleware for pea2pea nodes: constant-rate or Poisson outbound traffic, automatic frame padding, and priority lanes for cover traffic."
+license = "CC0-1.0 OR MIT"
 repository = "https://github.com/ljedrz/peashape"
+homepage = "https://github.com/ljedrz/peashape"
+documentation = "https://docs.rs/peashape"
 readme = "README.md"
-keywords = ["p2p", "networking", "privacy", "cover-traffic", "middleware"]
 categories = ["network-programming", "asynchronous"]
+keywords = ["p2p", "networking", "privacy", "cover-traffic", "middleware"]
+rust-version = "1.88"
 
 [dependencies]
 pea2pea = "0.56"

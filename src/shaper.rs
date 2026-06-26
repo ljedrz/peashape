@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bytes::BytesMut;
 use parking_lot::Mutex;
@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 
 use crate::config::{CoverGenerator, Lane, ShapeConfig, ShapingScope};
 use crate::error::Error;
-use crate::frame::{random_cover, ID_SIZE};
+use crate::frame::{ID_SIZE, random_cover};
 
 /// Capacity of the broadcast channel used to deliver received
 /// messages to application subscribers. When the channel is full,

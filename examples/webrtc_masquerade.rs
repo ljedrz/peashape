@@ -46,8 +46,8 @@
 //!
 //! Run with: cargo run --example webrtc_masquerade
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};

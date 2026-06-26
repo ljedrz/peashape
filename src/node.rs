@@ -2,14 +2,14 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use pea2pea::{
-    protocols::{Reading, Writing},
     Config, ConnectionSide, Node as P2pNode, Pea2Pea,
+    protocols::{Reading, Writing},
 };
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;

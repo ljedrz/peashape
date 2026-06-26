@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use peashape::{Node, ShapeConfig, ShapingStrategy, ID_SIZE};
+use peashape::{ID_SIZE, Node, ShapeConfig, ShapingStrategy};
 
 /// A minimal application-level payload format. Real messages
 /// start with this 4-byte magic header followed by a 1-byte

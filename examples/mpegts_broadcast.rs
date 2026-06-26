@@ -52,8 +52,8 @@
 //! Run with: cargo run --example mpegts_broadcast
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
@@ -321,10 +321,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some((pid, cc, pusi, scrambling)) = parse_ts(&buf) {
                         valid += 1;
                         pids.insert(pid);
-                        if let Some(prev) = last_cc {
-                            if cc != (prev + 1) & 0x0f {
-                                discontinuities += 1;
-                            }
+                        if let Some(prev) = last_cc
+                            && cc != (prev + 1) & 0x0f
+                        {
+                            discontinuities += 1;
                         }
                         last_cc = Some(cc);
                         let real = recover(&buf);
