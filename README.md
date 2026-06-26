@@ -1,5 +1,9 @@
 # peashape
 
+[![Crates.io](https://img.shields.io/crates/v/peashape.svg)](https://crates.io/crates/peashape)
+[![Documentation](https://docs.rs/peashape/badge.svg)](https://docs.rs/peashape)
+[![dependency status](https://deps.rs/repo/github/ljedrz/peashape/status.svg)](https://deps.rs/repo/github/ljedrz/peashape)
+
 A traffic-shaping middleware for [`pea2pea`] nodes. It
 enforces two simple rules on every outbound frame:
 
@@ -23,6 +27,22 @@ hop of a multi-hop network gives "cover on top of cover": every
 frame is re-padded and re-timed by the local shaper as it
 passes through, so a passive observer who can only watch one
 link still cannot correlate traffic across hops.
+
+### 📖 Table of Contents
+
+- [Quick start](#quick-start)
+- [Priority lanes](#priority-lanes)
+- [Shaping strategies](#shaping-strategies)
+- [Scopes: global vs. per-connection](#scopes-global-vs-per-connection)
+- [Unicast and broadcast](#unicast-and-broadcast)
+- [Threat model](#threat-model)
+- [Choosing the shaping rate](#choosing-the-shaping-rate)
+- [Custom cover traffic](#custom-cover-traffic)
+- [Composition with `peasub`](#composition-with-peasub)
+- [License](#license)
+- [Peapod](#-peapod)
+
+---
 
 ## Quick start
 
