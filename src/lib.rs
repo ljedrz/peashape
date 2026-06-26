@@ -96,6 +96,18 @@
 //! destination of user activity beyond the rate the node has
 //! been configured for.
 //!
+//! The one caveat is *destination* under sustained **unicast**
+//! traffic in [`ShapingScope::Global`]: a peer that is the
+//! steady recipient of real unicast frames receives them at a
+//! marginally higher long-run rate than its cover-only share,
+//! a residual aggregate signal inherent to carrying unicast
+//! over a gossip-style fanout (see [`Scheduler`]). Broadcast
+//! traffic spreads uniformly and is unaffected, and
+//! [`ShapingScope::PerConnection`] removes the signal entirely
+//! — a real frame merely occupies the cover slot the
+//! recipient's link was going to emit anyway. Use
+//! `PerConnection` for unicast-heavy workloads.
+//!
 //! `peashape` does **not** attempt to defeat:
 //!
 //! - an observer that can compromise the node itself;
