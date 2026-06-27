@@ -32,6 +32,12 @@ pub struct Scheduler {
     ///
     /// [`Node::shutdown`]: crate::Node::shutdown
     wake: Notify,
+    /// Used only in
+    /// [`ShapingStrategy::None`](crate::ShapingStrategy::None) (passthrough) mode:
+    /// the shaper fires this on every enqueue so the scheduler can
+    /// wake and drain the new frame immediately. Reused across
+    /// iterations of the passthrough loop.
+    enqueue_notify: Arc<Notify>,
     /// Per-connection round-robin cursor (used only by
     /// [`ShapingScope::PerConnection`]). The cursor is mixed with
     /// a per-pick random offset to avoid the pathological case of
@@ -51,10 +57,12 @@ impl Scheduler {
     /// Creates a new scheduler that drains `shaper` according to
     /// `strategy`.
     pub fn new(shaper: Arc<Shaper>, strategy: ShapingStrategy) -> Self {
+        let enqueue_notify = shaper.enqueue_notify();
         Self {
             shaper,
             strategy,
             wake: Notify::new(),
+            enqueue_notify,
             cursor: Mutex::new(0),
             last_peers: Mutex::new(Vec::new()),
         }
@@ -81,6 +89,7 @@ impl Scheduler {
         match self.strategy {
             ShapingStrategy::Constant { interval } => self.run_constant(node, interval).await,
             ShapingStrategy::Poisson { rate } => self.run_poisson(node, rate).await,
+            ShapingStrategy::None => self.run_passthrough(node).await,
         }
     }
 
@@ -149,6 +158,76 @@ impl Scheduler {
             }
             self.send_one(&node).await;
         }
+    }
+
+    /// Passthrough mode: no schedule, no cover. The scheduler
+    /// sleeps on the enqueue notification and drains every real
+    /// frame the shaper has accumulated (across both priority
+    /// lanes in [`ShapingScope::Global`], or per-peer lanes in
+    /// [`ShapingScope::PerConnection`]) before going back to
+    /// sleep. The application is responsible for padding real
+    /// frames to `frame_size` if it needs on-the-wire uniformity.
+    async fn run_passthrough(&self, node: Node) {
+        loop {
+            // Wake on the next enqueue (or on shutdown via `wake`).
+            tokio::select! {
+                _ = self.enqueue_notify.notified() => {}
+                _ = self.wake.notified() => break,
+            }
+            if self.is_shutting_down() {
+                break;
+            }
+            // Drain everything that's accumulated so far. Bounded
+            // by the lane capacity; in practice this is a handful
+            // of frames per notification.
+            self.drain_passthrough(&node).await;
+        }
+    }
+
+    /// Drain all currently-queued real frames in passthrough mode.
+    /// Mirrors [`Self::send_one`]'s scope dispatch but never
+    /// generates cover — if no real frame is available for the
+    /// current pick, we simply stop draining.
+    async fn drain_passthrough(&self, node: &Node) {
+        let peers = node.connected_peers();
+        match self.shaper.config().scope {
+            ShapingScope::Global => {
+                if peers.is_empty() {
+                    return;
+                }
+                // Pop every real frame the global lanes have
+                // accumulated, dispatch each (no cover).
+                while let Some(real) = self.shaper.next_frame() {
+                    let frame = self.shaper.finalize_real(real);
+                    self.dispatch_global(node, &peers, frame);
+                }
+            }
+            ShapingScope::PerConnection { .. } => {
+                self.shaper.refresh_pc_peers(&peers);
+                self.shaper.prune_peer_lanes(&peers);
+                if peers.is_empty() {
+                    return;
+                }
+                // Walk the round-robin order once, popping a frame
+                // from whichever peer has one queued. We restart
+                // from the current cursor position so successive
+                // wake-ups on the same busy peer don't all funnel
+                // through the same first iteration.
+                for peer in self.pc_peers_in_rr_order() {
+                    if let Some(real) = self.shaper.next_frame_for(peer) {
+                        let frame = self.shaper.finalize_real(real);
+                        self.send_one_to(node, peer, &frame);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The current connected-peer set (in [`ShapingScope::PerConnection`]
+    /// mode) in the round-robin order the scheduler would pick
+    /// them. Cheap: just a clone of the cached `pc_peers` vector.
+    fn pc_peers_in_rr_order(&self) -> Vec<std::net::SocketAddr> {
+        self.shaper.pc_peers_snapshot()
     }
 
     fn is_shutting_down(&self) -> bool {

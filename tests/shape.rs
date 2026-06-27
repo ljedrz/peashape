@@ -1225,3 +1225,111 @@ async fn per_connection_unicast_does_not_starve_other_links() {
     carol.shutdown().await;
     dave.shutdown().await;
 }
+
+/// In passthrough mode (`ShapingStrategy::None`), the scheduler
+/// emits *no* cover traffic: it only ships real frames, and it
+/// ships each one as soon as it is enqueued, without waiting for
+/// a tick. This test confirms that a unicast from alice reaches
+/// bob and that bob sees *only* the real frame (no cover frames
+/// are emitted even though the connection is otherwise idle).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passthrough_mode_sends_only_real_frames() {
+    let cfg = |name: &str, scope: ShapingScope| test_config(name, ShapingStrategy::None, scope);
+    let alice = Node::new(cfg(
+        "alice",
+        ShapingScope::PerConnection { randomize: true },
+    ));
+    let bob = Node::new(cfg("bob", ShapingScope::PerConnection { randomize: true }));
+    alice.spawn().await.unwrap();
+    bob.spawn().await.unwrap();
+
+    let bob_addr = bob.local_addr().await.unwrap();
+    alice.connect(bob_addr).await.unwrap();
+
+    let mut bob_rx = bob.subscribe();
+    let marker = b"passthrough-marker".to_vec();
+    alice.send_shaped(bob_addr, &marker).unwrap();
+
+    // The frame should arrive promptly — no waiting for a tick.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut got = false;
+    let mut total_frames = 0;
+    while Instant::now() < deadline && !got {
+        if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(50), bob_rx.recv()).await {
+            total_frames += 1;
+            if contains_payload(&buf[ID_SIZE..], &marker) {
+                got = true;
+            }
+        }
+    }
+    assert!(got, "passthrough: real frame never arrived at bob");
+
+    // After the real frame has been delivered, the scheduler
+    // produces nothing further: any extra frames observed here
+    // would be cover traffic, which the passthrough strategy
+    // promises not to emit. We give it a comfortable window to
+    // *not* produce anything.
+    let quiet_deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < quiet_deadline {
+        if let Ok(Ok(_buf)) = tokio::time::timeout(Duration::from_millis(50), bob_rx.recv()).await {
+            total_frames += 1;
+        }
+    }
+    assert_eq!(
+        total_frames, 1,
+        "passthrough: expected exactly 1 frame on the wire, got {total_frames}"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// Passthrough mode under `ShapingScope::Global` also drains
+/// queued real frames without generating cover, but routes
+/// `Broadcast` enqueues to `fanout` peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passthrough_global_broadcast_reaches_fanout() {
+    let cfg = |name: &str| {
+        let mut c = test_config(name, ShapingStrategy::None, ShapingScope::Global);
+        c.fanout = 2;
+        c
+    };
+    let alice = Node::new(cfg("alice"));
+    let bobs: Vec<_> = (0..3).map(|i| Node::new(cfg(&format!("bob{i}")))).collect();
+    alice.spawn().await.unwrap();
+    for b in &bobs {
+        b.spawn().await.unwrap();
+        alice.connect(b.local_addr().await.unwrap()).await.unwrap();
+    }
+
+    let marker = b"global-passthrough-marker".to_vec();
+    alice.broadcast_shaped(&marker).unwrap();
+
+    let mut receivers: Vec<_> = bobs.iter().map(|b| b.subscribe()).collect();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut got = vec![false; bobs.len()];
+    while Instant::now() < deadline && got.iter().any(|g| !g) {
+        for (i, rx) in receivers.iter_mut().enumerate() {
+            if got[i] {
+                continue;
+            }
+            if let Ok(Ok(buf)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+                && contains_payload(&buf[ID_SIZE..], &marker)
+            {
+                got[i] = true;
+            }
+        }
+    }
+    // `fanout=2`, so exactly 2 of the 3 bobs must have received
+    // the broadcast, and the third must not.
+    let got_count = got.iter().filter(|g| **g).count();
+    assert_eq!(
+        got_count, 2,
+        "passthrough/global: expected exactly fanout=2 recipients, got {got_count}"
+    );
+
+    alice.shutdown().await;
+    for b in bobs {
+        b.shutdown().await;
+    }
+}

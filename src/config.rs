@@ -300,6 +300,20 @@ pub enum ShapingStrategy {
         /// The Poisson-process rate, in frames per second.
         rate: f64,
     },
+
+    /// No scheduling at all: no cover traffic, no constant-rate
+    /// emission. Real (application-submitted) frames are sent as
+    /// soon as they are enqueued, at the byte size the application
+    /// supplied (the application is still responsible for padding
+    /// to `frame_size` if it needs on-the-wire uniformity).
+    ///
+    /// Use this when the protocol above `peashape` does not need
+    /// metadata-privacy properties (constant rate, constant size)
+    /// and would rather not pay the cover-traffic bandwidth cost.
+    /// Both ends of a connection must use the same strategy; the
+    /// receive side still enforces `frame_size`, so both ends
+    /// should be in `None` and agree on `frame_size`.
+    None,
 }
 
 /// Whether the scheduler ticks once for the whole node, or once

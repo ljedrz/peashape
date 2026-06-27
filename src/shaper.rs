@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use bytes::BytesMut;
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::config::{CoverGenerator, Lane, ShapeConfig, ShapingScope};
 use crate::error::Error;
@@ -117,6 +117,12 @@ pub struct Shaper {
     /// [`ShapeConfig::cover_generator`], defaulting to
     /// [`random_cover`].
     cover_generator: Arc<dyn CoverGenerator>,
+    /// Wakes the scheduler whenever a real frame is enqueued. Only
+    /// consulted by the `None` shaping strategy (passthrough mode)
+    /// — the timed strategies tick on their own schedule and ignore
+    /// this signal. One notification per enqueue, coalesced across
+    /// many enqueues that arrive between scheduler wake-ups.
+    enqueue_notify: Arc<Notify>,
 }
 
 impl Shaper {
@@ -159,7 +165,16 @@ impl Shaper {
             pc_peers: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
             cover_generator,
+            enqueue_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Returns a clone of the enqueue-notification handle. The
+    /// scheduler uses this to wake when a real frame has been
+    /// enqueued; this is only relevant in
+    /// [`ShapingStrategy::None`](crate::ShapingStrategy::None) (passthrough) mode.
+    pub fn enqueue_notify(&self) -> Arc<Notify> {
+        self.enqueue_notify.clone()
     }
 
     /// Returns a reference to the configuration this shaper was
@@ -251,7 +266,7 @@ impl Shaper {
                 expected: self.config.frame_size,
             });
         }
-        match self.config.scope {
+        let result = match self.config.scope {
             // Global scope: one shared pair of lanes; the scheduler
             // decides fanout/recipients at dispatch time.
             ShapingScope::Global => self.push_global(
@@ -271,7 +286,13 @@ impl Shaper {
                     Ok(())
                 }
             },
-        }
+        };
+        // Wake the scheduler so passthrough mode can drain the new
+        // frame immediately. The timed strategies tick on their own
+        // schedule and ignore this signal; the notification is
+        // harmless for them.
+        self.enqueue_notify.notify_one();
+        result
     }
 
     /// Push a frame onto the shared (global-scope) lanes.
@@ -391,6 +412,14 @@ impl Shaper {
         let mut cache = self.pc_peers.lock();
         cache.clear();
         cache.extend_from_slice(peers);
+    }
+
+    /// Returns a clone of the cached connected-peer set consulted
+    /// by `Broadcast` fan-out in [`ShapingScope::PerConnection`]
+    /// mode. Used by the passthrough scheduler to walk the
+    /// round-robin order.
+    pub fn pc_peers_snapshot(&self) -> Vec<SocketAddr> {
+        self.pc_peers.lock().clone()
     }
 
     /// Drops the per-connection lanes of any peer not in
