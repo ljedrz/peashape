@@ -1,6 +1,6 @@
 [package]
 name = "peashape"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["ljedrz <ljedrz@gmail.com>"]
 edition = "2024"
 description = "A traffic-shaping middleware for pea2pea nodes: constant-rate or Poisson outbound traffic, automatic frame padding, and priority lanes for cover traffic."
